@@ -1989,12 +1989,18 @@
       const gid = gIdMap[task.id];
       try {
         if (gid) {
-          // Update existing Google Task
-          await fetch(GTASKS_API + '/lists/' + gTasklistId + '/tasks/' + gid, {
+          // Update existing Google Task — fall back to create if it was deleted remotely
+          const patchResp = await fetch(GTASKS_API + '/lists/' + gTasklistId + '/tasks/' + gid, {
             method: 'PATCH',
             headers: { Authorization: 'Bearer ' + gAccessToken, 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
           });
+          if (patchResp.status === 404) {
+            // Remote task gone — remove stale map entry and create a fresh one
+            delete gIdMap[task.id];
+            saveGIdMap();
+            await gSyncTask(task); // recurse once to hit the POST branch
+          }
         } else {
           // Create new Google Task
           const r = await fetch(GTASKS_API + '/lists/' + gTasklistId + '/tasks', {
