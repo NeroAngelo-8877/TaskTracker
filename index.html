@@ -332,6 +332,23 @@
                 </select>
               </div>
             </div>
+            <!-- Reschedule row -->
+            <div class="border border-dashed border-amber-300 bg-amber-50/60 rounded-lg px-3 py-2.5 space-y-1.5">
+              <label class="flex items-center space-x-2 cursor-pointer select-none">
+                <input type="checkbox" id="drawerRescheduleToggle" class="rounded border-slate-300 text-amber-500 focus:ring-amber-400">
+                <span class="text-[11px] font-semibold text-amber-800 flex items-center"><i data-lucide="calendar-clock" class="w-3.5 h-3.5 mr-1 text-amber-600"></i>Reschedule Due Date</span>
+              </label>
+              <div id="drawerRescheduleFields" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <div>
+                  <label class="block text-[11px] font-semibold text-slate-600 mb-0.5">Current Due Date</label>
+                  <div id="drawerCurrentDueDisplay" class="text-xs px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-500 font-mono">—</div>
+                </div>
+                <div>
+                  <label for="drawerNewDueDate" class="block text-[11px] font-semibold text-slate-600 mb-0.5">New Due Date *</label>
+                  <input type="datetime-local" id="drawerNewDueDate" class="w-full text-xs px-2.5 py-1.5 bg-white border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400">
+                </div>
+              </div>
+            </div>
             <div>
               <label for="drawerUpdateNote" class="block text-[11px] font-semibold text-slate-600 mb-0.5">Progress Notes *</label>
               <textarea id="drawerUpdateNote" required rows="2" placeholder="Record current milestone, findings, or next actions..." class="w-full text-xs px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none"></textarea>
@@ -1114,6 +1131,10 @@
       on('closeDrawerBtn',  'click', closeDrawer);
       on('drawerBackdrop',  'click', closeDrawer);
       on('drawerUpdateForm','submit', handleDrawerSubmit);
+      on('drawerRescheduleToggle','change', e => {
+        const fields = document.getElementById('drawerRescheduleFields');
+        if (fields) fields.classList.toggle('hidden', !e.target.checked);
+      });
 
       // Export / Import
       on('exportBtn', 'click', exportJSON);
@@ -1408,6 +1429,15 @@
       currentDrawerTaskId = task.id;
       populateDrawer(task);
       document.getElementById('drawerUpdateDate').value = localDT();
+      // Reset reschedule toggle and fields
+      const toggle = document.getElementById('drawerRescheduleToggle');
+      const fields = document.getElementById('drawerRescheduleFields');
+      if (toggle) toggle.checked = false;
+      if (fields) fields.classList.add('hidden');
+      document.getElementById('drawerNewDueDate') && (document.getElementById('drawerNewDueDate').value = '');
+      // Show current due date in the reschedule panel
+      const curDue = document.getElementById('drawerCurrentDueDisplay');
+      if (curDue) curDue.textContent = formatDate(task.dueDate);
       show('statusDrawer'); if (window.lucide) lucide.createIcons();
     }
 
@@ -1435,12 +1465,19 @@
       if (tl) {
         const ups = [...(task.statusUpdates||[])].sort((a,b) => new Date(b.timestamp)-new Date(a.timestamp));
         tl.innerHTML = ups.length ? ups.map(u => `
-          <div class="relative bg-white p-3 rounded-lg border border-slate-200 text-xs shadow-sm space-y-1">
-            <div class="w-2.5 h-2.5 rounded-full bg-indigo-500 absolute -left-[27px] top-4 ring-4 ring-white"></div>
+          <div class="relative bg-white p-3 rounded-lg border ${u.rescheduled ? 'border-amber-300' : 'border-slate-200'} text-xs shadow-sm space-y-1">
+            <div class="w-2.5 h-2.5 rounded-full ${u.rescheduled ? 'bg-amber-400' : 'bg-indigo-500'} absolute -left-[27px] top-4 ring-4 ring-white"></div>
             <div class="flex items-center justify-between text-[11px]">
-              <span class="font-semibold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded">${escapeHTML(u.stage)}</span>
+              <span class="font-semibold ${u.rescheduled ? 'text-amber-800 bg-amber-50' : 'text-indigo-700 bg-indigo-50'} px-2 py-0.5 rounded">${escapeHTML(u.stage)}</span>
               <span class="text-slate-400 font-mono">${formatDate(u.timestamp)}</span>
             </div>
+            ${u.rescheduled ? `
+            <div class="flex items-center space-x-1.5 text-[11px] pt-0.5">
+              <i data-lucide="calendar-clock" class="w-3.5 h-3.5 text-amber-500 shrink-0"></i>
+              <span class="text-slate-400 line-through">${formatDate(u.rescheduled.from)}</span>
+              <i data-lucide="arrow-right" class="w-3 h-3 text-slate-400 shrink-0"></i>
+              <span class="font-bold text-amber-700">${formatDate(u.rescheduled.to)}</span>
+            </div>` : ''}
             <p class="text-slate-700 leading-relaxed pt-1">${escapeHTML(u.notes)}</p>
           </div>`).join('')
           : '<div class="text-xs text-slate-400 italic">No status updates logged yet.</div>';
@@ -1453,17 +1490,42 @@
       e.preventDefault();
       if (!currentDrawerTaskId) return;
       const task = tasks.find(t => t.id === currentDrawerTaskId); if (!task) return;
-      const ts   = document.getElementById('drawerUpdateDate').value || new Date().toISOString();
-      const stage= document.getElementById('drawerUpdateStage').value;
-      const notes= document.getElementById('drawerUpdateNote').value.trim();
+      const ts    = document.getElementById('drawerUpdateDate').value || new Date().toISOString();
+      const stage = document.getElementById('drawerUpdateStage').value;
+      const notes = document.getElementById('drawerUpdateNote').value.trim();
       if (!notes) { showToast('Progress notes are required.', 'warning'); return; }
+
+      // ── Reschedule handling ──────────────────────────────────
+      const rescheduleOn  = document.getElementById('drawerRescheduleToggle')?.checked;
+      const newDueRaw     = document.getElementById('drawerNewDueDate')?.value;
+      let rescheduled     = null; // { from, to } — recorded in audit entry if changed
+      if (rescheduleOn) {
+        if (!newDueRaw) { showToast('Select a new due date to reschedule.', 'warning'); return; }
+        rescheduled = { from: task.dueDate, to: newDueRaw };
+        task.dueDate = newDueRaw;
+        notifiedTaskIds.delete(task.id); // reset overdue alarm for new date
+      }
+
       if (!task.statusUpdates) task.statusUpdates = [];
-      task.statusUpdates.push({ id: uid(), timestamp: ts, stage, notes });
+      task.statusUpdates.push({ id: uid(), timestamp: ts, stage, notes, ...(rescheduled && { rescheduled }) });
       task.updatedAt = new Date().toISOString();
-      await TaskDB.put(task); await syncToCloud(task);
+      await TaskDB.put(task); await syncToCloud(task); gSyncTask(task);
+
+      // Reset form fields
       document.getElementById('drawerUpdateNote').value = '';
-      populateDrawer(task); renderApp(); updateStorageMetrics();
-      showToast('Status update logged', 'success'); playChime(500, 0.08);
+      const toggle = document.getElementById('drawerRescheduleToggle');
+      const fields = document.getElementById('drawerRescheduleFields');
+      if (toggle) toggle.checked = false;
+      if (fields) fields.classList.add('hidden');
+      const newDueFld = document.getElementById('drawerNewDueDate');
+      if (newDueFld) newDueFld.value = '';
+      // Update current due display in case it changed
+      const curDue = document.getElementById('drawerCurrentDueDisplay');
+      if (curDue) curDue.textContent = formatDate(task.dueDate);
+
+      populateDrawer(task); renderApp(); updateStorageMetrics(); checkDailyReminders(); evaluateDueAlarms();
+      showToast(rescheduled ? 'Status logged & due date updated' : 'Status update logged', 'success');
+      playChime(500, 0.08);
     }
 
     // ── Daily Reminders & Digest (AC-05) ──────────────────────
