@@ -2021,32 +2021,52 @@
       return payload;
     }
 
-    async function gEnsureToken() {
+    async function gEnsureToken(allowInteractive = false) {
       if (gIsSignedIn()) return true;
       if (!GOOGLE_CLIENT_ID || typeof google === 'undefined') return false;
-      // Token expired — request silently (no UI popup)
       return new Promise(resolve => {
-        if (!gTokenClient) { resolve(false); return; }
+        if (!gTokenClient) {
+          gTokenClient = google.accounts.oauth2.initTokenClient({
+            client_id: GOOGLE_CLIENT_ID,
+            scope: GTASKS_SCOPE + ' ' + GTASKS_PEOPLE_SCOPE,
+            callback: async resp => {
+              if (resp.error) { resolve(false); return; }
+              gAccessToken = resp.access_token;
+              gTokenExpiry = Date.now() + (resp.expires_in - 60) * 1000;
+              await gFetchProfile();
+              await gEnsureTasklist();
+              updateGTasksUI();
+              resolve(true);
+            }
+          });
+        }
         const orig = gTokenClient.callback;
         gTokenClient.callback = async resp => {
-          if (resp.error) { resolve(false); return; }
+          if (resp.error) {
+            if (allowInteractive) {
+              showToast('Google authentication failed: ' + (resp.error_description || resp.error), 'error');
+            }
+            resolve(false);
+            return;
+          }
           gAccessToken = resp.access_token;
           gTokenExpiry = Date.now() + (resp.expires_in - 60) * 1000;
+          await gFetchProfile();
           await gEnsureTasklist();
+          updateGTasksUI();
           resolve(true);
         };
-        gTokenClient.requestAccessToken({ prompt: 'none' });
-        // restore original callback for interactive use
-        setTimeout(() => { if (gTokenClient) gTokenClient.callback = orig; }, 5000);
+        gTokenClient.requestAccessToken({ prompt: allowInteractive ? '' : 'none' });
+        setTimeout(() => { if (gTokenClient) gTokenClient.callback = orig; }, 10000);
       });
     }
 
     // Push a single task to Google Tasks (create or update)
     async function gSyncTask(task) {
-      if (!gIsSignedIn() && !(await gEnsureToken())) return;
+      if (!gIsSignedIn() && !(await gEnsureToken(false))) return false;
       if (!gTasklistId) await gEnsureTasklist();
-      if (!gTasklistId) return;
-      if (task.id.startsWith('bench-')) return; // skip synthetic stress-test records
+      if (!gTasklistId) return false;
+      if (task.id.startsWith('bench-')) return false; // skip synthetic stress-test records
       const payload = gTaskPayload(task);
       const gid = gIdMap[task.id];
       try {
@@ -2057,12 +2077,19 @@
             headers: { Authorization: 'Bearer ' + gAccessToken, 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
           });
+          if (patchResp.status === 401) {
+            gAccessToken = null;
+            gTokenExpiry = 0;
+            updateGTasksUI();
+            return false;
+          }
           if (patchResp.status === 404) {
             // Remote task gone — remove stale map entry and create a fresh one
             delete gIdMap[task.id];
             saveGIdMap();
-            await gSyncTask(task); // recurse once to hit the POST branch
+            return await gSyncTask(task); // recurse once to hit the POST branch
           }
+          return patchResp.ok;
         } else {
           // Create new Google Task
           const r = await fetch(GTASKS_API + '/lists/' + gTasklistId + '/tasks', {
@@ -2070,18 +2097,29 @@
             headers: { Authorization: 'Bearer ' + gAccessToken, 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
           });
+          if (r.status === 401) {
+            gAccessToken = null;
+            gTokenExpiry = 0;
+            updateGTasksUI();
+            return false;
+          }
           if (r.ok) {
             const created = await r.json();
             gIdMap[task.id] = created.id;
             saveGIdMap();
+            return true;
           }
+          return false;
         }
-      } catch (e) { console.warn('gSyncTask:', e.message); }
+      } catch (e) {
+        console.warn('gSyncTask:', e.message);
+        return false;
+      }
     }
 
     // Delete a task from Google Tasks
     async function gDeleteTask(localId) {
-      if (!gIsSignedIn() && !(await gEnsureToken())) return;
+      if (!gIsSignedIn() && !(await gEnsureToken(false))) return;
       if (!gTasklistId) return;
       const gid = gIdMap[localId];
       if (!gid) return;
@@ -2097,21 +2135,35 @@
 
     // Push all local (non-bench) tasks to Google Tasks
     async function gSyncAll() {
-      if (!gIsSignedIn() && !(await gEnsureToken())) {
-        showToast('Not signed in to Google — tap Sign in first.', 'warning'); return;
+      if (!gIsSignedIn()) {
+        const tokenOk = await gEnsureToken(false);
+        if (!tokenOk) {
+          // Silent refresh failed (typical on mobile browsers) — trigger interactive sign-in prompt
+          showToast('Requesting Google authorization…', 'info');
+          const interactiveOk = await gEnsureToken(true);
+          if (!interactiveOk) {
+            showToast('Sign in with Google to enable task sync.', 'warning');
+            return;
+          }
+        }
       }
       const eligible = tasks.filter(t => !t.id.startsWith('bench-'));
       if (eligible.length === 0) { showToast('No tasks to sync.', 'info'); return; }
       setEl('gTasksSyncStatus', 'Syncing…');
       let ok = 0;
+      let failed = 0;
       for (const task of eligible) {
-        await gSyncTask(task);
-        ok++;
-        if (ok % 10 === 0) setEl('gTasksSyncStatus', `${ok} / ${eligible.length}`);
+        const success = await gSyncTask(task);
+        if (success) ok++; else failed++;
+        if ((ok + failed) % 10 === 0) setEl('gTasksSyncStatus', `${ok} / ${eligible.length}`);
         await new Promise(r => setTimeout(r, 0)); // keep UI responsive
       }
-      setEl('gTasksSyncStatus', `✓ ${ok} pushed`);
-      showToast(`Synced ${ok} task(s) to Google Tasks`, 'success');
+      setEl('gTasksSyncStatus', failed > 0 ? `✓ ${ok} synced (${failed} skipped/failed)` : `✓ ${ok} pushed`);
+      if (failed > 0) {
+        showToast(`Synced ${ok} task(s); ${failed} failed (check Google connection)`, 'warning');
+      } else {
+        showToast(`Synced ${ok} task(s) to Google Tasks`, 'success');
+      }
     }
 
     function gSignOut() {
@@ -2140,6 +2192,9 @@
         setEl('gUserEmail', gUserProfile?.email || '');
         const avatar = document.getElementById('gUserAvatar');
         if (avatar) avatar.textContent = (gUserProfile?.name || 'G').charAt(0).toUpperCase();
+        if (!gIsSignedIn() && gUserProfile) {
+          setEl('gTasksSyncStatus', 'Session expired (tap Push to re-auth)');
+        }
       } else {
         outDiv.classList.remove('hidden');
         inDiv.classList.add('hidden');
